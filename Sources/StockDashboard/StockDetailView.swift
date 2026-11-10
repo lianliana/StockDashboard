@@ -6,7 +6,7 @@ import SwiftUI
 struct StockDetailView: View {
     let instrument: Instrument
     let quote: Quote?
-    let market: TencentMarketData
+    let market: MarketData
 
     @State private var request = HistoryRequest()
     @State private var chart = ChartState.loading
@@ -22,9 +22,14 @@ struct StockDetailView: View {
                 chartSection
                 Divider()
                 quoteStatistics
-                Text("数据来源：腾讯行情 · 报价可能有延迟")
+                Text("报价来源 \(instrument.quoteSource) · 报价可能有延迟")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if instrument.exchange == .shanghaiGold {
+                    Text("走势来源 上海黄金交易所 · 每 60 秒刷新报价，休市时显示最近成交价")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             .padding(26)
             .frame(maxWidth: 920, alignment: .leading)
@@ -32,6 +37,9 @@ struct StockDetailView: View {
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .task(id: request) { await loadHistory(request.range) }
+        .onChange(of: quote?.time) {
+            if range == .day { request.revision += 1 }
+        }
     }
 
     private var quoteHeader: some View {
@@ -60,7 +68,7 @@ struct StockDetailView: View {
             }
             .monospacedDigit()
             if let quote {
-                Text("报价于 \(quote.time.formatted(date: .abbreviated, time: .shortened))")
+                Text("报价于 \(quote.time.formatted(date: .abbreviated, time: .standard))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -97,7 +105,7 @@ struct StockDetailView: View {
                     ContentUnavailableView {
                         Label("走势暂不可用", systemImage: "chart.xyaxis.line")
                     } actions: {
-                        Button("重试") { request.retry += 1 }
+                        Button("重试") { request.revision += 1 }
                             .controlSize(.small)
                     }
                 }
@@ -201,6 +209,6 @@ struct StockDetailView: View {
 
     private struct HistoryRequest: Equatable {
         var range = HistoryRange.day
-        var retry = 0
+        var revision = 0
     }
 }

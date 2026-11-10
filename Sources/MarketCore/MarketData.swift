@@ -1,7 +1,7 @@
 import CoreFoundation
 import Foundation
 
-public struct TencentMarketData: Sendable {
+public struct MarketData: Sendable {
     private static let chartHost = "proxy.finance.qq.com"
     private static let chartPath = "/ifzqgtimg/appstock/app/"
 
@@ -10,18 +10,25 @@ public struct TencentMarketData: Sendable {
     public func search(_ query: String) async throws -> [Instrument] {
         let lookup = SearchQuery(query)
         guard !lookup.text.isEmpty else { return [] }
-        let data = try await request("smartbox.gtimg.cn", "/s3/", [
-            URLQueryItem(name: "q", value: lookup.text),
-            URLQueryItem(name: "t", value: "all"),
-            URLQueryItem(name: "c", value: "24"),
-        ])
-        var results = try searchMatches(in: data)
-        if lookup.isBeijingCode, !results.contains(where: { $0.exchange == .beijing }) {
-            if let instrument = try await findBeijingInstrument(code: lookup.text) {
-                results.insert(instrument, at: 0)
-            }
-        }
         let suggestions = Instrument.suggested.filter(lookup.matchesSuggestion)
+        var results: [Instrument]
+        do {
+            let data = try await request("smartbox.gtimg.cn", "/s3/", [
+                URLQueryItem(name: "q", value: lookup.text),
+                URLQueryItem(name: "t", value: "all"),
+                URLQueryItem(name: "c", value: "24"),
+            ])
+            results = try searchMatches(in: data)
+            if lookup.isBeijingCode, !results.contains(where: { $0.exchange == .beijing }) {
+                if let instrument = try await findBeijingInstrument(code: lookup.text) {
+                    results.insert(instrument, at: 0)
+                }
+            }
+        } catch {
+            guard !suggestions.isEmpty else { throw error }
+            results = []
+        }
+        try Task.checkCancellation()
         var seen = Set<Instrument.ID>()
         return (suggestions + results).filter { instrument in
             (lookup.exchange == nil || lookup.exchange == instrument.exchange)
@@ -30,6 +37,29 @@ public struct TencentMarketData: Sendable {
     }
 
     public func quotes(for instruments: [Instrument]) async throws -> [Instrument.ID: Quote] {
+        async let stockResult = try? stockQuotes(for: instruments.filter { $0.exchange != .shanghaiGold })
+        async let goldResult = try? goldQuotes(for: instruments.filter { $0.exchange == .shanghaiGold })
+        let (stocks, gold) = await (stockResult, goldResult)
+        try Task.checkCancellation()
+        let quotes = (stocks ?? [:]).merging(gold ?? [:]) { _, newer in newer }
+        if quotes.isEmpty, !instruments.isEmpty { throw DataError.unavailable }
+        return quotes
+    }
+
+    public func history(for instrument: Instrument, range: HistoryRange) async throws -> [PricePoint] {
+        let points: [PricePoint]
+        if instrument.exchange == .shanghaiGold {
+            points = try await goldHistory(for: instrument, range: range)
+        } else if range == .day {
+            points = try await intraday(for: instrument)
+        } else {
+            points = try await daily(for: instrument, count: range.tradingDays)
+        }
+        guard points.count >= 2 else { throw DataError.unavailable }
+        return points
+    }
+
+    private func stockQuotes(for instruments: [Instrument]) async throws -> [Instrument.ID: Quote] {
         var quotes: [Instrument.ID: Quote] = [:]
         for offset in stride(from: 0, to: instruments.count, by: 60) {
             let batch = instruments.dropFirst(offset).prefix(60)
@@ -40,18 +70,81 @@ public struct TencentMarketData: Sendable {
                 }
             }
         }
-        if quotes.isEmpty, !instruments.isEmpty { throw DataError.unavailable }
         return quotes
     }
 
-    public func history(for instrument: Instrument, range: HistoryRange) async throws -> [PricePoint] {
-        let points = if range == .day {
-            try await intraday(for: instrument)
-        } else {
-            try await daily(for: instrument, count: range.tradingDays)
+    private func goldQuotes(for instruments: [Instrument]) async throws -> [Instrument.ID: Quote] {
+        var quotes: [Instrument.ID: Quote] = [:]
+        for instrument in instruments {
+            let data = try await request("hq.sinajs.cn", "/list=gds_" + instrument.sourceCode,
+                                         referer: "https://finance.sina.com.cn/")
+            let text = try decodeQuoteText(data)
+            guard let first = text.firstIndex(of: "\""), let last = text.lastIndex(of: "\""), first < last else {
+                throw DataError.invalidResponse
+            }
+            let fields = text[text.index(after: first)..<last].split(separator: ",", omittingEmptySubsequences: false)
+            guard fields.count > 12, let price = Double(fields[0]), price.isFinite, price > 0,
+                  let previousClose = Double(fields[7]), previousClose.isFinite, previousClose > 0,
+                  let time = dateFormatter("yyyy-MM-dd HH:mm:ss", exchange: instrument.exchange)
+                    .date(from: fields[12] + " " + fields[6]) else { throw DataError.invalidResponse }
+            let change = price - previousClose
+            quotes[instrument.id] = Quote(
+                price: price,
+                previousClose: previousClose,
+                open: Double(fields[8]),
+                high: Double(fields[4]),
+                low: Double(fields[5]),
+                change: change,
+                changePercent: change / previousClose * 100,
+                time: time
+            )
         }
-        guard points.count >= 2 else { throw DataError.unavailable }
-        return points
+        return quotes
+    }
+
+    private func goldHistory(for instrument: Instrument, range: HistoryRange) async throws -> [PricePoint] {
+        let items = [URLQueryItem(name: "instid", value: instrument.symbol)]
+        let dailyData = try await request("www.sge.com.cn", "/graph/Dailyhq", items, referer: "https://www.sge.com.cn/")
+        let daily = try JSONDecoder().decode(GoldDailyPayload.self, from: dailyData)
+        let formatter = dateFormatter("yyyy-MM-dd", exchange: instrument.exchange)
+        let history = daily.time.compactMap { point -> PricePoint? in
+            guard let date = formatter.date(from: point.date), point.close.isFinite, point.close > 0 else { return nil }
+            return PricePoint(date: date, price: point.close)
+        }
+        if range != .day { return Array(history.suffix(range.tradingDays)) }
+
+        let minuteData = try await request("www.sge.com.cn", "/graph/quotations", items, referer: "https://www.sge.com.cn/")
+        let minute = try JSONDecoder().decode(GoldMinutePayload.self, from: minuteData)
+        guard let cutoff = dateFormatter("yyyy年M月d日 HH:mm:ss", exchange: instrument.exchange)
+            .date(from: minute.delaystr) else { throw DataError.invalidResponse }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = instrument.exchange.timeZone
+        let today = calendar.startOfDay(for: cutoff)
+        let isEvening = calendar.component(.hour, from: cutoff) >= 20
+        let evening: Date
+        if isEvening {
+            evening = today
+        } else {
+            guard let previousTradingDay = history.last(where: { $0.date < today })?.date else {
+                throw DataError.unavailable
+            }
+            evening = previousTradingDay
+        }
+        let overnight = calendar.date(byAdding: .day, value: 1, to: evening)!
+        let daytime = isEvening ? overnight : today
+        let timeFormatter = dateFormatter("yyyy-MM-dd HH:mm", exchange: instrument.exchange)
+        return zip(minute.times, minute.data).compactMap { clock, value in
+            guard let value, let price = Double(value), price.isFinite, price > 0 else { return nil }
+            var date = daytime
+            if clock >= "20:00" {
+                date = evening
+            } else if clock < "06:00" {
+                date = overnight
+            }
+            guard let time = timeFormatter.date(from: formatter.string(from: date) + " " + clock),
+                  time <= cutoff else { return nil }
+            return PricePoint(date: time, price: price)
+        }
     }
 
     private func searchMatches(in data: Data) throws -> [Instrument] {
@@ -150,14 +243,15 @@ public struct TencentMarketData: Sendable {
         }
     }
 
-    private func request(_ host: String, _ path: String, _ items: [URLQueryItem] = []) async throws -> Data {
+    private func request(_ host: String, _ path: String, _ items: [URLQueryItem] = [],
+                         referer: String = "https://finance.qq.com/") async throws -> Data {
         var components = URLComponents()
         components.scheme = "https"
         components.host = host
         components.path = path
         if !items.isEmpty { components.queryItems = items }
         var request = URLRequest(url: components.url!, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
-        request.setValue("https://finance.qq.com/", forHTTPHeaderField: "Referer")
+        request.setValue(referer, forHTTPHeaderField: "Referer")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
             throw DataError.unavailable
@@ -182,7 +276,7 @@ public struct TencentMarketData: Sendable {
     }
 }
 
-private extension TencentMarketData {
+private extension MarketData {
     enum DataError: Error {
         case unavailable
         case invalidResponse
@@ -218,8 +312,33 @@ private extension TencentMarketData {
         func matchesSuggestion(_ instrument: Instrument) -> Bool {
             let search = text.filter { !$0.isWhitespace }
             guard !search.isEmpty else { return false }
-            return instrument.symbol.localizedCaseInsensitiveContains(search)
-                || instrument.name.filter { !$0.isWhitespace }.localizedCaseInsensitiveContains(search)
+            var terms = [instrument.symbol, instrument.sourceCode, instrument.name]
+            if instrument.exchange == .shanghaiGold {
+                terms += ["黄金", "上海黄金交易所", "上金所", "沪金"]
+            }
+            return terms.contains { $0.filter { !$0.isWhitespace }.localizedCaseInsensitiveContains(search) }
+        }
+    }
+
+    struct GoldMinutePayload: Decodable {
+        let times: [String]
+        let data: [String?]
+        let delaystr: String
+    }
+
+    struct GoldDailyPayload: Decodable {
+        let time: [GoldDailyPoint]
+    }
+
+    struct GoldDailyPoint: Decodable {
+        let date: String
+        let close: Double
+
+        init(from decoder: Decoder) throws {
+            var fields = try decoder.unkeyedContainer()
+            date = try fields.decode(String.self)
+            _ = try fields.decode(Double.self)
+            close = try fields.decode(Double.self)
         }
     }
 

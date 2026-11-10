@@ -125,21 +125,26 @@ private struct WatchlistSidebar: View {
 
     private var watchlist: some View {
         @Bindable var model = model
-        return List(selection: $model.selection) {
-            ForEach(model.snapshot.instruments) { instrument in
-                WatchlistRow(instrument: instrument, quote: model.snapshot.quotes[instrument.id])
-                    .tag(instrument.id)
-                    .contextMenu { editMenu(for: instrument) }
+        return GeometryReader { geometry in
+            List(selection: $model.selection) {
+                ForEach(model.snapshot.instruments) { instrument in
+                    WatchlistRow(instrument: instrument, quote: model.snapshot.quotes[instrument.id])
+                        // During restoration, sidebar cells can propose zero width.
+                        // Use the sidebar width minus its 16 pt content insets on each side.
+                        .frame(width: max(0, geometry.size.width - 32))
+                        .tag(instrument.id)
+                        .contextMenu { editMenu(for: instrument) }
+                }
+                .onMove { offsets, destination in
+                    model.move(from: offsets, to: destination)
+                }
             }
-            .onMove { offsets, destination in
-                model.move(from: offsets, to: destination)
-            }
-        }
-        .listStyle(.sidebar)
-        .overlay {
-            if model.snapshot.instruments.isEmpty {
-                ContentUnavailableView("自选列表为空", systemImage: "star",
-                                       description: Text("搜索名称或代码来添加。"))
+            .listStyle(.sidebar)
+            .overlay {
+                if model.snapshot.instruments.isEmpty {
+                    ContentUnavailableView("自选列表为空", systemImage: "star",
+                                           description: Text("搜索名称或代码来添加。"))
+                }
             }
         }
     }
@@ -272,8 +277,15 @@ private struct WatchlistRow: View {
             .lineLimit(1)
             Spacer(minLength: 0)
             VStack(alignment: .trailing, spacing: 4) {
-                Text(quote?.priceText ?? "—")
-                    .fontWeight(.medium)
+                HStack(alignment: .firstTextBaseline, spacing: 3) {
+                    Text(quote?.priceText ?? "—")
+                        .fontWeight(.medium)
+                    if instrument.exchange == .shanghaiGold {
+                        Text(instrument.unit)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 if let quote {
                     let color = instrument.changeColor(quote.changePercent)
                     Text(quote.percentText)

@@ -6,6 +6,7 @@ public enum Exchange: String, Codable, Sendable {
     case shenzhen = "sz"
     case beijing = "bj"
     case unitedStates = "us"
+    case shanghaiGold = "sge"
 
     public var name: String {
         switch self {
@@ -13,6 +14,7 @@ public enum Exchange: String, Codable, Sendable {
         case .shenzhen: "深圳"
         case .beijing: "北京"
         case .unitedStates: "美国"
+        case .shanghaiGold: "上海黄金交易所"
         }
     }
 
@@ -37,6 +39,7 @@ public struct Instrument: Codable, Hashable, Identifiable, Sendable {
     public var id: String { quoteKey }
 
     public var symbol: String {
+        if exchange == .shanghaiGold { return "Au99.99" }
         guard exchange == .unitedStates else { return sourceCode }
         if isIndex { return String(sourceCode.dropFirst()) }
         return String(sourceCode[..<sourceCode.lastIndex(of: ".")!])
@@ -49,13 +52,19 @@ public struct Instrument: Codable, Hashable, Identifiable, Sendable {
     var historyKey: String { exchange.rawValue + sourceCode }
 
     public var unit: String {
+        if exchange == .shanghaiGold { return "元/克" }
         if isIndex { return "点" }
         return exchange == .unitedStates ? "USD" : "CNY"
     }
 
     public var category: String {
+        if exchange == .shanghaiGold { return "上海黄金交易所现货" }
         if isIndex { return "\(exchange.name)指数" }
         return exchange == .unitedStates ? "美股" : "\(exchange.name) A 股"
+    }
+
+    public var quoteSource: String {
+        exchange == .shanghaiGold ? "新浪财经" : "腾讯行情"
     }
 
     public func changeColor(_ change: Double) -> Color {
@@ -73,6 +82,7 @@ public struct Instrument: Codable, Hashable, Identifiable, Sendable {
         .init(exchange: .shenzhen, sourceCode: "399001", name: "深证成指", isIndex: true),
         .init(exchange: .shenzhen, sourceCode: "399006", name: "创业板指", isIndex: true),
         .init(exchange: .shanghai, sourceCode: "000300", name: "沪深 300", isIndex: true),
+        .init(exchange: .shanghaiGold, sourceCode: "AU9999", name: "上海金"),
     ]
 }
 

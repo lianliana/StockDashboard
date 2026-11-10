@@ -25,7 +25,7 @@ final class DashboardModel {
     private(set) var storageError = false
     var selection: Instrument.ID?
 
-    let market = TencentMarketData()
+    let market = MarketData()
     @ObservationIgnored private var quoteRequest: Task<Void, Never>?
 
     init() {

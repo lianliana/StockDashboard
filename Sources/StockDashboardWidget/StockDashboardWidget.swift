@@ -10,7 +10,7 @@ struct StockDashboardWidget: Widget {
                 .containerBackground(for: .widget) { Color(nsColor: .windowBackgroundColor) }
         }
         .configurationDisplayName("自选行情")
-        .description("查看 StockDashboard 自选列表中的指数和股票。")
+        .description("查看 StockDashboard 自选列表中的指数、股票和上海金。")
         .supportedFamilies([.systemSmall, .systemMedium, .systemLarge])
     }
 }
@@ -22,7 +22,7 @@ private struct WatchlistEntry: TimelineEntry {
 
 private struct WatchlistProvider: TimelineProvider {
     private static let cacheKey = "lastQuotes"
-    private let market = TencentMarketData()
+    private let market = MarketData()
 
     func placeholder(in context: Context) -> WatchlistEntry {
         WatchlistEntry(snapshot: .initial)
@@ -120,13 +120,14 @@ private struct WatchlistWidgetView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Spacer(minLength: 1)
-                Text(quote?.priceText ?? "—")
+                Text((quote?.priceText ?? "—") + (instrument.exchange == .shanghaiGold ? " 元/克" : ""))
                     .font(.callout.monospacedDigit())
                     .fixedSize()
             }
             if let quote {
                 let color = instrument.changeColor(quote.changePercent)
-                Text(quote.percentText)
+                Text(family == .systemSmall && instrument.exchange == .shanghaiGold
+                     ? quote.priceText + " 元/克" : quote.percentText)
                     .font(.caption.weight(.semibold).monospacedDigit())
                     .foregroundStyle(color)
                     .padding(.horizontal, 5)
@@ -139,6 +140,8 @@ private struct WatchlistWidgetView: View {
             }
         }
         .accessibilityElement(children: .combine)
+        .help(quote.map { "\(instrument.name) · 报价于 \($0.time.formatted(date: .abbreviated, time: .standard))" }
+              ?? instrument.name)
     }
 
     private func message(_ text: String) -> some View {
